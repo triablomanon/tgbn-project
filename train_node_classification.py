@@ -25,7 +25,7 @@ from evaluate_models_utils import evaluate_model_node_classification
 from utils.DataLoader import get_idx_data_loader, get_node_classification_tgb_data, get_node_classification_tgb_data_filtered
 from utils.EarlyStopping import EarlyStopping
 from utils.load_configs import get_node_classification_args
-from utils.MAFeatures import MAFeatures, to_one_hot_if_needed
+from utils.MAFeatures import MAFeatures
 
 if __name__ == "__main__":
 
@@ -260,13 +260,9 @@ if __name__ == "__main__":
                         with torch.no_grad():
                             for idx in train_idx:
                                 node_id = int(batch_src_node_ids[idx])
-                                # Convert label to one-hot (take argmax for multi-label case)
-                                label_one_hot = to_one_hot_if_needed(labels[idx], num_classes)
-                                if label_one_hot.dim() > 1:  # If already multi-hot, take argmax
-                                    label_idx = label_one_hot.argmax().item()
-                                    label_one_hot = torch.zeros(num_classes, device=label_one_hot.device)
-                                    label_one_hot[label_idx] = 1.0
-                                ma_tracker.update_dict(node_id, label_one_hot.cpu().numpy())
+                                # Use full probability distribution (labels are already normalized)
+                                label_dist = labels[idx].cpu().numpy()
+                                ma_tracker.update_dict(node_id, label_dist)
 
                     train_idx_data_loader_tqdm.set_description(f'Epoch: {epoch + 1}, train for the {batch_idx + 1}-th batch, train loss: {loss.item()}')
 

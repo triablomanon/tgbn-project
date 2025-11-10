@@ -1,7 +1,15 @@
 # Moving Average (MA) Features Integration Plan for DyGFormer
 
 ## Overview
-Add optional moving average features to DyGFormer for node classification tasks on temporal graphs. MA features track historical label patterns for each node using an exponential moving average with a sliding window.
+Add optional moving average features to DyGFormer for node classification tasks on temporal graphs. MA features track historical label **probability distributions** for each node using an exponential moving average with a sliding window.
+
+## IMPORTANT: Labels Are Probability Distributions
+After inspecting the tgbn-genre dataset, we discovered that labels are **NOT** binary multi-hot vectors. Instead, they are **probability distributions** that sum to 1.0:
+- Average of ~11 active genres per node
+- Each active genre has a probability weight (e.g., [0.17, 0.11, 0.09, ...])
+- Sum of all probabilities = 1.0
+
+**Implementation Decision**: MA features use the **full probability distribution**, not just the argmax. This preserves all genre information and creates richer temporal features.
 
 ## Rationale for Test Updates
 **Question**: Why update MA features during test/validation?
