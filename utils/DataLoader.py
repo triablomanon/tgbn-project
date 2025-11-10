@@ -2,6 +2,7 @@ import os
 import copy
 import numpy as np
 from tqdm import tqdm
+from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader
 from tgb.linkproppred.dataset import LinkPropPredDataset
 from tgb.nodeproppred.dataset_pyg import PyGNodePropPredDataset
@@ -245,23 +246,236 @@ def get_node_classification_tgb_data(dataset_name: str):
         # dictionary, key is a tuple (interact time, node id), value is the interaction index
         # for the first time, we need to compute labeled_node_interaction_indices and store it
         labeled_node_interaction_indices = {}
-        for (node_label_time, src_node_id) in tqdm(converted_label_dict.keys(), desc=f"data preprocessing for {dataset_name}"):
-            # record the most recent interaction index (i.e., edge id) of node src_node_id
-            # ndarray, shape (num_edges, )
-            nodes_historical_interactions_mask = (src_node_ids == src_node_id) & (node_interact_times <= node_label_time)
-            if len(edge_ids[nodes_historical_interactions_mask]) > 0:
-                nodes_most_recent_interaction_idx = edge_ids[nodes_historical_interactions_mask][-1]
-                assert nodes_most_recent_interaction_idx == np.where(nodes_historical_interactions_mask)[0][-1], \
-                    "Mismatched interaction index with edge id!"
-            else:
-                nodes_most_recent_interaction_idx = 0
-                print("Warning: a labeled node is not matched, use the first interaction to match it")
-            # use the index of the most recent interaction of the labeled node (deal with mismatched issue with the exact interaction time in label_dict)
-            labeled_node_interaction_indices[(node_label_time, src_node_id)] = nodes_most_recent_interaction_idx
+
+        # OPTIMIZED VERSION: Group labels by node to avoid scanning all edges repeatedly
+        print(f"Optimized preprocessing for {dataset_name}...")
+
+        # Group labels by source node
+        labels_by_node = defaultdict(list)
+        for (node_label_time, src_node_id) in converted_label_dict.keys():
+            labels_by_node[src_node_id].append(node_label_time)
+
+        # Pre-compute indices for each node (only scan edges once per node)
+        for src_node_id in tqdm(labels_by_node.keys(), desc=f"data preprocessing for {dataset_name}"):
+            # Get all interactions for this node (scan once per node, not once per label)
+            node_mask = src_node_ids == src_node_id
+            node_interactions_indices = np.where(node_mask)[0]
+            node_interactions_times = node_interact_times[node_mask]
+            node_edge_ids = edge_ids[node_mask]
+
+            # For each label timestamp for this node, use binary search to find the right interaction
+            for node_label_time in labels_by_node[src_node_id]:
+                # Find index of most recent interaction before or at node_label_time
+                valid_idx = np.searchsorted(node_interactions_times, node_label_time, side='right') - 1
+
+                if valid_idx >= 0 and valid_idx < len(node_interactions_indices):
+                    nodes_most_recent_interaction_idx = node_edge_ids[valid_idx]
+                    # Verify correctness
+                    assert nodes_most_recent_interaction_idx == node_interactions_indices[valid_idx], \
+                        "Mismatched interaction index with edge id!"
+                else:
+                    nodes_most_recent_interaction_idx = 0
+                    print(f"Warning: a labeled node {src_node_id} at time {node_label_time} is not matched, use the first interaction")
+
+                labeled_node_interaction_indices[(node_label_time, src_node_id)] = nodes_most_recent_interaction_idx
+
         assert len(converted_label_dict.keys()) == len(labeled_node_interaction_indices.keys()), "Mismatched dictionary keys!"
 
         os.makedirs(f"./saved_labeled_node_interaction_indices", exist_ok=True)
         np.save(f"./saved_labeled_node_interaction_indices/{dataset_name}.npy", labeled_node_interaction_indices)
+
+    # set labels and interact_types
+    min_val_time = node_interact_times[val_mask].min()
+    min_test_time = node_interact_times[test_mask].min()
+    assert min_val_time > node_interact_times[train_mask].max(), "Train data and validation data are mixed!"
+    assert min_test_time > node_interact_times[val_mask].max(), "Validation data and test data are mixed!"
+
+    for (node_label_time, src_node_id) in tqdm(converted_label_dict.keys()):
+        interaction_idx = labeled_node_interaction_indices[(node_label_time, src_node_id)]
+        labels[interaction_idx] = converted_label_dict[(node_label_time, src_node_id)]
+        node_label_times[interaction_idx] = node_label_time
+        if min_val_time <= node_label_time < min_test_time:
+            interact_types[interaction_idx] = "validate"
+        elif node_label_time >= min_test_time:
+            interact_types[interaction_idx] = "test"
+        else:
+            interact_types[interaction_idx] = "train"
+
+    # note that in our data preprocess pipeline, we add an extra node and edge with index 0 as the padded node/edge for convenience of model computation,
+    # therefore, for TGB, we also manually add the extra node and edge with index 0
+    src_node_ids = src_node_ids + 1
+    dst_node_ids = dst_node_ids + 1
+    edge_ids = edge_ids + 1
+
+    MAX_FEAT_DIM = 172
+    if 'node_feat' not in data.keys():
+        node_raw_features = np.zeros((num_nodes + 1, 1))
+    else:
+        node_raw_features = data['node_feat'].astype(np.float64)
+        # deal with node features whose shape has only one dimension
+        if len(node_raw_features.shape) == 1:
+            node_raw_features = node_raw_features[:, np.newaxis]
+
+    # add feature of padded node and padded edge
+    node_raw_features = np.vstack([np.zeros(node_raw_features.shape[1])[np.newaxis, :], node_raw_features])
+    edge_raw_features = np.vstack([np.zeros(edge_raw_features.shape[1])[np.newaxis, :], edge_raw_features])
+
+    assert MAX_FEAT_DIM >= node_raw_features.shape[1], f'Node feature dimension in dataset {dataset_name} is bigger than {MAX_FEAT_DIM}!'
+    assert MAX_FEAT_DIM >= edge_raw_features.shape[1], f'Edge feature dimension in dataset {dataset_name} is bigger than {MAX_FEAT_DIM}!'
+
+    full_data = Data(src_node_ids=src_node_ids, dst_node_ids=dst_node_ids, node_interact_times=node_interact_times, edge_ids=edge_ids,
+                     labels=labels, interact_types=interact_types, node_label_times=node_label_times)
+    train_data = Data(src_node_ids=src_node_ids[train_mask], dst_node_ids=dst_node_ids[train_mask], node_interact_times=node_interact_times[train_mask],
+                      edge_ids=edge_ids[train_mask], labels=labels[train_mask], interact_types=interact_types[train_mask], node_label_times=node_label_times[train_mask])
+    val_data = Data(src_node_ids=src_node_ids[val_mask], dst_node_ids=dst_node_ids[val_mask], node_interact_times=node_interact_times[val_mask],
+                    edge_ids=edge_ids[val_mask], labels=labels[val_mask], interact_types=interact_types[val_mask], node_label_times=node_label_times[val_mask])
+    test_data = Data(src_node_ids=src_node_ids[test_mask], dst_node_ids=dst_node_ids[test_mask], node_interact_times=node_interact_times[test_mask],
+                     edge_ids=edge_ids[test_mask], labels=labels[test_mask], interact_types=interact_types[test_mask], node_label_times=node_label_times[test_mask])
+
+    print("The dataset has {} interactions, involving {} different nodes".format(full_data.num_interactions, full_data.num_unique_nodes))
+    print("The training dataset has {} interactions, involving {} different nodes".format(train_data.num_interactions, train_data.num_unique_nodes))
+    print("The validation dataset has {} interactions, involving {} different nodes".format(val_data.num_interactions, val_data.num_unique_nodes))
+    print("The test dataset has {} interactions, involving {} different nodes".format(test_data.num_interactions, test_data.num_unique_nodes))
+
+    return node_raw_features, edge_raw_features, full_data, train_data, val_data, test_data, eval_metric_name, num_classes
+
+
+def get_node_classification_tgb_data_filtered(dataset_name: str, subset_fraction: float = 0.1,
+                                              timestamp_threshold: float = None, seed: int = 42):
+    """
+    generate filtered tgb data for node classification task
+    :param dataset_name: str, dataset name
+    :param subset_fraction: float, fraction of source nodes to keep (e.g., 0.1 for 10%)
+    :param timestamp_threshold: float, optional timestamp threshold to filter data
+    :param seed: int, random seed for reproducibility
+    :return: node_raw_features, edge_raw_features, (np.ndarray),
+            full_data, train_data, val_data, test_data, (Data object), eval_metric_name, num_classes
+    """
+    # Load data and train val test split
+    dataset = PyGNodePropPredDataset(name=dataset_name, root="datasets")
+    data = dataset.dataset.full_data
+
+    src_node_ids = data['sources'].astype(np.longlong)
+    dst_node_ids = data['destinations'].astype(np.longlong)
+    node_interact_times = data['timestamps'].astype(np.float64)
+    edge_ids = data['edge_idxs'].astype(np.longlong)
+    edge_raw_features = data['edge_feat'].astype(np.float64)
+
+    # ============= FILTERING LOGIC =============
+    # 1. Select subset of source nodes
+    unique_src_nodes = np.unique(src_node_ids)
+    np.random.seed(seed)
+    num_src_nodes_to_select = int(len(unique_src_nodes) * subset_fraction)
+    selected_src_nodes = np.random.choice(unique_src_nodes, size=num_src_nodes_to_select, replace=False)
+
+    # 2. Create combined mask
+    src_node_mask = np.isin(src_node_ids, selected_src_nodes)
+
+    if timestamp_threshold is not None:
+        time_mask = node_interact_times > timestamp_threshold
+        combined_mask = np.logical_and(src_node_mask, time_mask)
+    else:
+        combined_mask = src_node_mask
+
+    # Update masks before filtering
+    train_mask = dataset.train_mask[combined_mask]
+    val_mask = dataset.val_mask[combined_mask]
+    test_mask = dataset.test_mask[combined_mask]
+
+    # 3. Apply filtering
+    original_num_interactions = len(src_node_ids)
+    src_node_ids = src_node_ids[combined_mask]
+    dst_node_ids = dst_node_ids[combined_mask]
+    node_interact_times = node_interact_times[combined_mask]
+    edge_ids = edge_ids[combined_mask]
+    edge_raw_features = edge_raw_features[combined_mask]
+
+    print(f"After filtering: {len(src_node_ids)} interactions (from {original_num_interactions} original)")
+    print(f"Selected {len(selected_src_nodes)} source nodes out of {len(unique_src_nodes)} ({subset_fraction*100}%)")
+    # ============= END FILTERING LOGIC =============
+
+    # deal with edge features whose shape has only one dimension
+    if len(edge_raw_features.shape) == 1:
+        edge_raw_features = edge_raw_features[:, np.newaxis]
+
+    num_edges = edge_raw_features.shape[0]
+    num_nodes = len(set(src_node_ids) | set(dst_node_ids))
+
+    assert src_node_ids.min() == 0 or dst_node_ids.min() == 0, "Node index should start from 0!"
+    assert edge_ids.min() == 0 or edge_ids.min() == 1, "Edge index should start from 0 or 1!"
+
+    if edge_ids.min() == 1:
+        print(f"Manually minus the edge indices by 1 on {dataset_name}")
+        edge_ids = edge_ids - 1
+    assert edge_ids.min() == 0, "After correction, edge index should start from 0!"
+
+    eval_metric_name = dataset.eval_metric
+    num_classes = dataset.num_classes
+
+    # in TGB, each node tends to be assigned with a label after a number of interactions, which is different from our setting
+    # we add interact_types property in Data to mark each interaction with value "train", "validate", "test" or "just_update"
+    # set node label, interact_type, and node label time for each interaction
+    labels = np.zeros((num_edges, num_classes))
+    interact_types = np.array(["just_update" for _ in range(num_edges)])
+    node_label_times = copy.deepcopy(node_interact_times)
+
+    # dictionary, key is interact time, value is a dictionary, whose key is node id, value is node label, which is a ndarray with shape (num_classes, )
+    label_dict = dataset.dataset.label_dict
+
+    # dictionary, key is a tuple (label time, node id), value is the node label, which is a ndarray (each element is float64 type) with shape (num_classes, )
+    converted_label_dict = {}
+    for node_label_time in tqdm(label_dict.keys()):
+        for src_node_id in label_dict[node_label_time].keys():
+            # Only include labels for nodes that are in our filtered dataset
+            if src_node_id in selected_src_nodes:
+                converted_label_dict[(node_label_time, src_node_id)] = label_dict[node_label_time][src_node_id]
+
+    # Use unique cache filename for filtered data
+    cache_filename = f"./saved_labeled_node_interaction_indices/{dataset_name}_subset{subset_fraction}_ts{timestamp_threshold}_seed{seed}.npy"
+
+    if os.path.exists(cache_filename):
+        # Load cached preprocessed data
+        labeled_node_interaction_indices = np.load(cache_filename, allow_pickle=True).tolist()
+        print(f"Loaded preprocessed cache from {cache_filename}")
+    else:
+        # OPTIMIZED PREPROCESSING (same as main function)
+        labeled_node_interaction_indices = {}
+        print(f"Optimized preprocessing for filtered {dataset_name}...")
+
+        # Group labels by source node
+        labels_by_node = defaultdict(list)
+        for (node_label_time, src_node_id) in converted_label_dict.keys():
+            labels_by_node[src_node_id].append(node_label_time)
+
+        # Pre-compute indices for each node (only scan edges once per node)
+        for src_node_id in tqdm(labels_by_node.keys(), desc=f"data preprocessing for filtered {dataset_name}"):
+            # Get all interactions for this node (scan once per node, not once per label)
+            node_mask = src_node_ids == src_node_id
+            node_interactions_indices = np.where(node_mask)[0]
+            node_interactions_times = node_interact_times[node_mask]
+            node_edge_ids = edge_ids[node_mask]
+
+            # For each label timestamp for this node, use binary search to find the right interaction
+            for node_label_time in labels_by_node[src_node_id]:
+                # Find index of most recent interaction before or at node_label_time
+                valid_idx = np.searchsorted(node_interactions_times, node_label_time, side='right') - 1
+
+                if valid_idx >= 0 and valid_idx < len(node_interactions_indices):
+                    nodes_most_recent_interaction_idx = node_edge_ids[valid_idx]
+                    # Verify correctness
+                    assert nodes_most_recent_interaction_idx == node_interactions_indices[valid_idx], \
+                        "Mismatched interaction index with edge id!"
+                else:
+                    nodes_most_recent_interaction_idx = 0
+                    print(f"Warning: a labeled node {src_node_id} at time {node_label_time} is not matched, use the first interaction")
+
+                labeled_node_interaction_indices[(node_label_time, src_node_id)] = nodes_most_recent_interaction_idx
+
+        assert len(converted_label_dict.keys()) == len(labeled_node_interaction_indices.keys()), "Mismatched dictionary keys!"
+
+        os.makedirs(f"./saved_labeled_node_interaction_indices", exist_ok=True)
+        np.save(cache_filename, labeled_node_interaction_indices)
+        print(f"Saved preprocessed cache to {cache_filename}")
 
     # set labels and interact_types
     min_val_time = node_interact_times[val_mask].min()
