@@ -25,6 +25,7 @@ from evaluate_models_utils import evaluate_model_node_classification
 from utils.DataLoader import get_idx_data_loader, get_node_classification_tgb_data, get_node_classification_tgb_data_filtered
 from utils.EarlyStopping import EarlyStopping
 from utils.load_configs import get_node_classification_args
+from utils.MAFeatures import MAFeatures, to_one_hot_if_needed
 
 if __name__ == "__main__":
 
@@ -125,7 +126,10 @@ if __name__ == "__main__":
                                          max_input_sequence_length=args.max_input_sequence_length, device=args.device)
         else:
             raise ValueError(f"Wrong value for model_name {args.model_name}!")
-        node_classifier = MLPClassifier(input_dim=args.output_dim, output_dim=num_classes, dropout=args.dropout)
+
+        # Adjust classifier input dimension if using MA features
+        classifier_input_dim = args.output_dim + num_classes if args.use_ma_features else args.output_dim
+        node_classifier = MLPClassifier(input_dim=classifier_input_dim, output_dim=num_classes, dropout=args.dropout)
         model = nn.Sequential(dynamic_backbone, node_classifier)
         logger.info(f'model -> {model}')
         logger.info(f'model name: {args.model_name}, #parameters: {get_parameter_sizes(model) * 4} B, '
@@ -135,6 +139,12 @@ if __name__ == "__main__":
         optimizer = create_optimizer(model=model[1], optimizer_name=args.optimizer, learning_rate=args.learning_rate, weight_decay=args.weight_decay)
 
         model = convert_to_gpu(model, device=args.device)
+
+        # Initialize MA feature tracker if enabled
+        ma_tracker = None
+        if args.use_ma_features:
+            ma_tracker = MAFeatures(num_class=num_classes, window=args.ma_window_size)
+            logger.info(f'MA Features enabled with window size: {args.ma_window_size}')
 
         save_model_folder = f"./saved_models/{args.model_name}/{args.dataset_name}/{args.save_model_name}/"
         shutil.rmtree(save_model_folder, ignore_errors=True)
@@ -216,6 +226,13 @@ if __name__ == "__main__":
                                 model[0].compute_src_dst_node_temporal_embeddings(src_node_ids=batch_src_node_ids,
                                                                                   dst_node_ids=batch_dst_node_ids,
                                                                                   node_interact_times=batch_node_interact_times)
+
+                            # Query MA features if enabled and concatenate with embeddings
+                            if args.use_ma_features:
+                                ma_feats = ma_tracker.batch_query(batch_src_node_ids)
+                                ma_feats = torch.from_numpy(ma_feats).float().to(batch_src_node_embeddings.device)
+                                batch_src_node_embeddings = torch.cat([batch_src_node_embeddings, ma_feats], dim=1)
+
                         else:
                             raise ValueError(f"Wrong value for model_name {args.model_name}!")
                     else:
@@ -237,6 +254,19 @@ if __name__ == "__main__":
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+
+                    # Update MA features if enabled
+                    if args.use_ma_features and args.model_name in ['DyGFormer']:
+                        with torch.no_grad():
+                            for idx in train_idx:
+                                node_id = int(batch_src_node_ids[idx])
+                                # Convert label to one-hot (take argmax for multi-label case)
+                                label_one_hot = to_one_hot_if_needed(labels[idx], num_classes)
+                                if label_one_hot.dim() > 1:  # If already multi-hot, take argmax
+                                    label_idx = label_one_hot.argmax().item()
+                                    label_one_hot = torch.zeros(num_classes, device=label_one_hot.device)
+                                    label_one_hot[label_idx] = 1.0
+                                ma_tracker.update_dict(node_id, label_one_hot.cpu().numpy())
 
                     train_idx_data_loader_tqdm.set_description(f'Epoch: {epoch + 1}, train for the {batch_idx + 1}-th batch, train loss: {loss.item()}')
 
@@ -266,7 +296,9 @@ if __name__ == "__main__":
                                                                          evaluator=evaluator,
                                                                          loss_func=loss_func,
                                                                          num_neighbors=args.num_neighbors,
-                                                                         time_gap=args.time_gap)
+                                                                         time_gap=args.time_gap,
+                                                                         ma_tracker=ma_tracker if args.use_ma_features else None,
+                                                                         num_classes=num_classes if args.use_ma_features else None)
 
             if args.model_name in ['JODIE', 'DyRep', 'TGN']:
                 # backup memory bank after validating so it can be used for testing nodes (since test edges are strictly later in time than validation edges)
@@ -291,7 +323,9 @@ if __name__ == "__main__":
                                                                                evaluator=evaluator,
                                                                                loss_func=loss_func,
                                                                                num_neighbors=args.num_neighbors,
-                                                                               time_gap=args.time_gap)
+                                                                               time_gap=args.time_gap,
+                                                                               ma_tracker=ma_tracker if args.use_ma_features else None,
+                                                                               num_classes=num_classes if args.use_ma_features else None)
 
                 if args.model_name in ['JODIE', 'DyRep', 'TGN']:
                     # reload validation memory bank for saving models
@@ -329,7 +363,9 @@ if __name__ == "__main__":
                                                                          evaluator=evaluator,
                                                                          loss_func=loss_func,
                                                                          num_neighbors=args.num_neighbors,
-                                                                         time_gap=args.time_gap)
+                                                                         time_gap=args.time_gap,
+                                                                         ma_tracker=ma_tracker if args.use_ma_features else None,
+                                                                         num_classes=num_classes if args.use_ma_features else None)
 
         test_losses, test_metrics = evaluate_model_node_classification(model_name=args.model_name,
                                                                        model=model,

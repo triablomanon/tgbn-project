@@ -19,6 +19,7 @@ from models.MovingAverage import MovingAverage
 from utils.utils import set_random_seed
 from utils.utils import NeighborSampler
 from utils.DataLoader import Data
+from utils.MAFeatures import to_one_hot_if_needed
 
 
 def evaluate_model_link_prediction(model_name: str, model: nn.Module, neighbor_sampler: NeighborSampler, evaluate_idx_data_loader: DataLoader,
@@ -169,7 +170,7 @@ def evaluate_model_link_prediction(model_name: str, model: nn.Module, neighbor_s
 
 def evaluate_model_node_classification(model_name: str, model: nn.Module, neighbor_sampler: NeighborSampler, evaluate_idx_data_loader: DataLoader,
                                        evaluate_data: Data, eval_stage: str, eval_metric_name: str, evaluator: NodeClassificationEvaluator,
-                                       loss_func: nn.Module, num_neighbors: int = 20, time_gap: int = 2000):
+                                       loss_func: nn.Module, num_neighbors: int = 20, time_gap: int = 2000, ma_tracker=None, num_classes: int = None):
     """
     evaluate models on the node classification task
     :param model_name: str, name of the model
@@ -259,6 +260,13 @@ def evaluate_model_node_classification(model_name: str, model: nn.Module, neighb
                             model[0].compute_src_dst_node_temporal_embeddings(src_node_ids=batch_src_node_ids,
                                                                               dst_node_ids=batch_dst_node_ids,
                                                                               node_interact_times=batch_node_interact_times)
+
+                        # Query MA features if enabled and concatenate with embeddings
+                        if ma_tracker is not None:
+                            ma_feats = ma_tracker.batch_query(batch_src_node_ids)
+                            ma_feats = torch.from_numpy(ma_feats).float().to(batch_src_node_embeddings.device)
+                            batch_src_node_embeddings = torch.cat([batch_src_node_embeddings, ma_feats], dim=1)
+
                     else:
                         raise ValueError(f"Wrong value for model_name {model_name}!")
                 else:
@@ -276,6 +284,19 @@ def evaluate_model_node_classification(model_name: str, model: nn.Module, neighb
                 for idx in eval_idx:
                     evaluate_predicts_per_timeslot_dict[batch_node_label_times[idx]].append(predicts[idx].softmax(dim=0).cpu().detach().numpy())
                     evaluate_labels_per_timeslot_dict[batch_node_label_times[idx]].append(labels[idx].cpu().detach().numpy())
+
+                # Update MA features if enabled (temporal progression during evaluation)
+                if ma_tracker is not None and model_name in ['DyGFormer']:
+                    with torch.no_grad():
+                        for idx in eval_idx:
+                            node_id = int(batch_src_node_ids[idx])
+                            # Convert label to one-hot (take argmax for multi-label case)
+                            label_one_hot = to_one_hot_if_needed(labels[idx], num_classes)
+                            if label_one_hot.dim() > 1:  # If already multi-hot, take argmax
+                                label_idx = label_one_hot.argmax().item()
+                                label_one_hot = torch.zeros(num_classes, device=label_one_hot.device)
+                                label_one_hot[label_idx] = 1.0
+                            ma_tracker.update_dict(node_id, label_one_hot.cpu().numpy())
 
                 evaluate_idx_data_loader_tqdm.set_description(f'{eval_stage} for the {batch_idx + 1}-th batch, loss: {loss.item()}')
 

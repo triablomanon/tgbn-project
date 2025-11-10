@@ -151,6 +151,8 @@ def get_node_classification_args(is_evaluation: bool = False):
     parser.add_argument('--subset_fraction', type=float, default=1.0, help='fraction of source nodes to keep (1.0 = all data)')
     parser.add_argument('--timestamp_threshold', type=float, default=None, help='timestamp threshold to filter data')
     parser.add_argument('--filter_seed', type=int, default=42, help='random seed for data filtering')
+    parser.add_argument('--use_ma_features', action='store_true', default=False, help='whether to use moving average features for node classification')
+    parser.add_argument('--ma_window_size', type=int, default=7, help='window size for moving average features')
     try:
         args = parser.parse_args()
         args.device = f'cuda:{args.gpu}' if torch.cuda.is_available() and args.gpu >= 0 else 'cpu'
