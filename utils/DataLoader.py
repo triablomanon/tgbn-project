@@ -402,12 +402,13 @@ def get_node_classification_tgb_data_filtered(dataset_name: str, subset_fraction
     num_nodes = len(set(src_node_ids) | set(dst_node_ids))
 
     assert src_node_ids.min() == 0 or dst_node_ids.min() == 0, "Node index should start from 0!"
-    assert edge_ids.min() == 0 or edge_ids.min() == 1, "Edge index should start from 0 or 1!"
 
-    if edge_ids.min() == 1:
-        print(f"Manually minus the edge indices by 1 on {dataset_name}")
-        edge_ids = edge_ids - 1
-    assert edge_ids.min() == 0, "After correction, edge index should start from 0!"
+    # After filtering, edge_ids will be based on array indices (not original edge IDs)
+    # The preprocessing algorithm uses edge_ids to map labels to interaction indices
+    # We need edge_ids[i] == i for the mapping to work correctly
+    edge_ids = np.arange(len(src_node_ids), dtype=np.longlong)
+
+    print(f"Set edge IDs to array indices: [0, {len(edge_ids)-1}]")
 
     eval_metric_name = dataset.eval_metric
     num_classes = dataset.num_classes
@@ -496,6 +497,23 @@ def get_node_classification_tgb_data_filtered(dataset_name: str, subset_fraction
 
     # note that in our data preprocess pipeline, we add an extra node and edge with index 0 as the padded node/edge for convenience of model computation,
     # therefore, for TGB, we also manually add the extra node and edge with index 0
+
+    # IMPORTANT: Re-index node IDs to be contiguous [0, num_nodes-1] and filter node features
+    # After filtering, node IDs might have gaps, and we need to map them to contiguous IDs
+    unique_nodes = np.unique(np.concatenate([src_node_ids, dst_node_ids]))
+    node_id_mapping = {old_id: new_id for new_id, old_id in enumerate(unique_nodes)}
+
+    # Apply node ID remapping
+    old_src_min, old_src_max = src_node_ids.min(), src_node_ids.max()
+    old_dst_min, old_dst_max = dst_node_ids.min(), dst_node_ids.max()
+    src_node_ids = np.array([node_id_mapping[nid] for nid in src_node_ids], dtype=np.longlong)
+    dst_node_ids = np.array([node_id_mapping[nid] for nid in dst_node_ids], dtype=np.longlong)
+
+    print(f"[FILTERED] Re-indexed {len(unique_nodes)} nodes:")
+    print(f"  - src_node_ids from [{old_src_min}, {old_src_max}] to [{src_node_ids.min()}, {src_node_ids.max()}]")
+    print(f"  - dst_node_ids from [{old_dst_min}, {old_dst_max}] to [{dst_node_ids.min()}, {dst_node_ids.max()}]")
+
+    # Now add 1 for padding
     src_node_ids = src_node_ids + 1
     dst_node_ids = dst_node_ids + 1
     edge_ids = edge_ids + 1
@@ -504,10 +522,15 @@ def get_node_classification_tgb_data_filtered(dataset_name: str, subset_fraction
     if 'node_feat' not in data.keys():
         node_raw_features = np.zeros((num_nodes + 1, 1))
     else:
-        node_raw_features = data['node_feat'].astype(np.float64)
+        # Load original node features and filter to only the nodes in our filtered dataset
+        original_node_raw_features = data['node_feat'].astype(np.float64)
         # deal with node features whose shape has only one dimension
-        if len(node_raw_features.shape) == 1:
-            node_raw_features = node_raw_features[:, np.newaxis]
+        if len(original_node_raw_features.shape) == 1:
+            original_node_raw_features = original_node_raw_features[:, np.newaxis]
+
+        # Extract features only for the nodes that appear in filtered data (using old node IDs)
+        node_raw_features = original_node_raw_features[unique_nodes]
+        print(f"[FILTERED] Filtered node features from {original_node_raw_features.shape[0]} to {node_raw_features.shape[0]} nodes")
 
     # add feature of padded node and padded edge
     node_raw_features = np.vstack([np.zeros(node_raw_features.shape[1])[np.newaxis, :], node_raw_features])
@@ -515,6 +538,13 @@ def get_node_classification_tgb_data_filtered(dataset_name: str, subset_fraction
 
     assert MAX_FEAT_DIM >= node_raw_features.shape[1], f'Node feature dimension in dataset {dataset_name} is bigger than {MAX_FEAT_DIM}!'
     assert MAX_FEAT_DIM >= edge_raw_features.shape[1], f'Edge feature dimension in dataset {dataset_name} is bigger than {MAX_FEAT_DIM}!'
+
+
+    # DEBUG: Check ranges before creating Data objects
+    print(f"[DEBUG] edge_ids range: [{edge_ids.min()}, {edge_ids.max()}]")
+    print(f"[DEBUG] edge_raw_features shape: {edge_raw_features.shape}, max valid index: {edge_raw_features.shape[0] - 1}")
+    print(f"[DEBUG] src_node_ids range: [{src_node_ids.min()}, {src_node_ids.max()}]")
+    print(f"[DEBUG] node_raw_features shape: {node_raw_features.shape}, max valid index: {node_raw_features.shape[0] - 1}")
 
     full_data = Data(src_node_ids=src_node_ids, dst_node_ids=dst_node_ids, node_interact_times=node_interact_times, edge_ids=edge_ids,
                      labels=labels, interact_types=interact_types, node_label_times=node_label_times)
