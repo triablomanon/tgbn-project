@@ -22,7 +22,7 @@ from models.modules import MLPClassifier
 from utils.utils import set_random_seed, convert_to_gpu, get_parameter_sizes, create_optimizer
 from utils.utils import get_neighbor_sampler
 from evaluate_models_utils import evaluate_model_node_classification
-from utils.DataLoader import get_idx_data_loader, get_node_classification_tgb_data
+from utils.DataLoader import get_idx_data_loader, get_node_classification_tgb_data, get_node_classification_tgb_data_filtered
 from utils.EarlyStopping import EarlyStopping
 from utils.load_configs import get_node_classification_args
 
@@ -34,8 +34,18 @@ if __name__ == "__main__":
     args = get_node_classification_args(is_evaluation=False)
 
     # get data for training, validation and testing
-    node_raw_features, edge_raw_features, full_data, train_data, val_data, test_data, eval_metric_name, num_classes = \
+    if args.subset_fraction < 1.0 or args.timestamp_threshold is not None:
+      node_raw_features, edge_raw_features, full_data, train_data, val_data, test_data, eval_metric_name, num_classes = \
+        get_node_classification_tgb_data_filtered(dataset_name=args.dataset_name, 
+                                                  subset_fraction=args.subset_fraction,
+                                                  timestamp_threshold=args.timestamp_threshold,
+                                                  seed=args.filter_seed)
+    else:
+      node_raw_features, edge_raw_features, full_data, train_data, val_data, test_data, eval_metric_name, num_classes = \
         get_node_classification_tgb_data(dataset_name=args.dataset_name)
+
+
+
 
     # initialize training neighbor sampler to retrieve temporal graph
     train_neighbor_sampler = get_neighbor_sampler(data=train_data, sample_neighbor_strategy=args.sample_neighbor_strategy,

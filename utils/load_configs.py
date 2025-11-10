@@ -148,7 +148,9 @@ def get_node_classification_args(is_evaluation: bool = False):
     parser.add_argument('--num_runs', type=int, default=5, help='number of runs')
     parser.add_argument('--test_interval_epochs', type=int, default=10, help='how many epochs to perform testing once')
     parser.add_argument('--load_best_configs', action='store_true', default=False, help='whether to load the best configurations')
-
+    parser.add_argument('--subset_fraction', type=float, default=1.0, help='fraction of source nodes to keep (1.0 = all data)')
+    parser.add_argument('--timestamp_threshold', type=float, default=None, help='timestamp threshold to filter data')
+    parser.add_argument('--filter_seed', type=int, default=42, help='random seed for data filtering')
     try:
         args = parser.parse_args()
         args.device = f'cuda:{args.gpu}' if torch.cuda.is_available() and args.gpu >= 0 else 'cpu'
