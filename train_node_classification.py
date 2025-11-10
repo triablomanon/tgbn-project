@@ -166,6 +166,10 @@ if __name__ == "__main__":
                 # reinitialize memory of memory-based models at the start of each epoch
                 model[0].memory_bank.__init_memory_bank__()
 
+            # reset MA tracker at the start of each epoch to maintain temporal consistency
+            if args.use_ma_features:
+                ma_tracker.reset()
+
             # store train losses and metrics
             train_losses, train_metrics = [], []
             # store the results for each timeslot, and finally compute the metric for each timeslot
@@ -373,7 +377,9 @@ if __name__ == "__main__":
                                                                        evaluator=evaluator,
                                                                        loss_func=loss_func,
                                                                        num_neighbors=args.num_neighbors,
-                                                                       time_gap=args.time_gap)
+                                                                       time_gap=args.time_gap,
+                                                                       ma_tracker=ma_tracker if args.use_ma_features else None,
+                                                                       num_classes=num_classes if args.use_ma_features else None)
 
         # store the evaluation metrics at the current run
         val_metric_dict, test_metric_dict = {}, {}

@@ -313,13 +313,53 @@ python train_node_classification.py \
 - Total memory: ~1-2 MB (negligible)
 
 ### Temporal Consistency
-1. **Epoch 1, Batch 1**: All nodes have zero MA features (never seen)
+1. **Epoch 1, Batch 1**: All nodes have zero MA features (tracker just reset)
 2. **Epoch 1, Batch 2**: Some nodes may have MA features from Batch 1
-3. **Epoch 2**: MA features carry over from Epoch 1 (accumulated knowledge)
-4. **Validation/Test**: Use accumulated MA features, continue updating as we progress
+3. **Epoch 1, Last Batch**: MA features accumulated from all batches in this epoch
+4. **Epoch 2, Batch 1**: MA tracker resets - all nodes back to zero MA features
+5. **Validation/Test**: MA tracker does NOT reset between val/test (different from training), continues updating as we progress through test data chronologically
 
-### No Reset Between Epochs
-Unlike some memory-based models, **MA tracker is NOT reset** between epochs. This allows the model to accumulate temporal label patterns across the entire training process.
+### MA Tracker Reset Between Epochs (CRITICAL FIX)
+**MA tracker IS reset** at the start of each epoch to maintain temporal consistency. This matches the TGN implementation.
+
+**Why Reset is Necessary**:
+- Each epoch processes the SAME temporal sequence: t₁ → t₂ → t₃ → ... → t_train
+- The data loader uses `shuffle=False`, so order is identical across epochs
+- Without reset: At start of Epoch 2, MA tracker contains information from late timestamps (t_train), creating temporal leakage when predicting early timestamps (t₁)
+- With reset: Each epoch starts fresh, ensuring we only use past information for predictions
+
+**Implementation** (line 169-171 in train_node_classification.py):
+```python
+# reset MA tracker at the start of each epoch to maintain temporal consistency
+if args.use_ma_features:
+    ma_tracker.reset()
+```
+
+### Temporal Flow Within Each Epoch
+
+**Data is strictly chronologically ordered:**
+- Training: t₁ → ... → t_train (earliest times)
+- Validation: t_val_start → ... → t_val_end (where t_val_start > t_train)
+- Test: t_test_start → ... → t_test_end (where t_test_start > t_val_end)
+
+**MA tracker behavior within an epoch:**
+1. Start of epoch: MA tracker is reset (empty)
+2. Training phase: MA features accumulate from t₁ to t_train
+3. Validation phase: MA tracker **continues** (no reset) because validation times come AFTER training times
+   - Uses MA features accumulated during training as historical context
+   - Continues updating MA tracker with validation labels
+4. Test phase: MA tracker **continues** (no reset) because test times come AFTER validation times
+   - Uses MA features accumulated during training + validation
+   - Continues updating MA tracker with test labels
+
+**Why no reset between train/val/test within an epoch?**
+- These splits are temporally ordered (val times > train times > test times)
+- MA features from training represent valid historical information for validation
+- This matches real-world deployment: we continuously observe labels and update our moving average
+
+**Why reset at start of each epoch?**
+- Training data repeats the same time sequence each epoch (shuffle=False)
+- Without reset, Epoch 2 would start at time t₁ but with MA features from time t_train, violating causality
 
 ## Testing Checklist
 
@@ -333,21 +373,33 @@ Unlike some memory-based models, **MA tracker is NOT reset** between epochs. Thi
 - [ ] NDCG@10 metric computed correctly
 - [ ] Model can save/load checkpoints (dimensions must match)
 
+## Resolved Design Decisions
+
+1. **MA tracker reset between epochs** ✓
+   - **Decision**: Reset at start of each training epoch (matches TGN)
+   - **Reason**: Prevents temporal leakage since each epoch repeats the same temporal sequence
+   - **Implementation**: Added `ma_tracker.reset()` at line 171
+
+2. **Use full probability distribution (not argmax)** ✓
+   - **Decision**: Use complete label distribution with ~11 active genres
+   - **Reason**: Labels are probability distributions (sum to 1.0), not binary vectors
+   - **Implementation**: Changed from argmax to using `labels[idx].cpu().numpy()` directly
+
+3. **Update MA during validation/test** ✓
+   - **Decision**: Update MA features during evaluation (no reset between train/val/test within an epoch)
+   - **Reason**: Validation and test times come strictly AFTER training times (t_val > t_train, t_test > t_val)
+   - **Implementation**: MA tracker accumulates across train→val→test within each epoch, but resets at the start of each new epoch
+
 ## Open Questions
 
 1. **Should MA tracker be saved in checkpoints?**
    - Pros: Enables exact resumption of training
-   - Cons: Increases checkpoint size
-   - **Recommendation**: Save it if checkpoint saving is needed for long training runs
+   - Cons: Increases checkpoint size, but tracker resets each epoch anyway
+   - **Recommendation**: Not necessary since tracker resets per epoch
 
 2. **Should MA features be used for other models (TGN, TGAT)?**
    - Currently scoped to DyGFormer only
    - Can extend to other models later if beneficial
-
-3. **Alternative to argmax for multi-label?**
-   - Current approach takes primary label (argmax)
-   - Could use full multi-hot vector instead of one-hot
-   - **Current choice**: One-hot for simplicity and consistency with TGN implementation
 
 ## Summary of Changes
 
